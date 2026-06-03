@@ -816,7 +816,7 @@ function getPlayheadTime() {
 }
 
 /* ════════════════════════════════════════════
-   [FIX] seekToLyric — 클릭 후 즉시 하이라이트 + 스와이핑 애니메이션
+   seekToLyric
 ════════════════════════════════════════════ */
 function seekToLyric(sec, e) {
     e?.preventDefault?.();
@@ -833,7 +833,6 @@ function seekToLyric(sec, e) {
     } else return;
     syncMediaSession();
 
-    // 클릭한 시간에 해당하는 가사 줄 즉시 탐색
     let idx = -1;
     for (let i = LY.lines.length - 1; i >= 0; i--) {
         if (t >= LY.lines[i].start) {
@@ -841,19 +840,14 @@ function seekToLyric(sec, e) {
             break;
         }
     }
-    // 이전 idx와 달라야 애니메이션이 발생하므로 강제로 다른 값에서 전환
-    const prevIdx = LY.curIdx;
     LY.curIdx = idx;
 
-    // 풀스크린이면 FS 하이라이트, 아니면 일반 하이라이트 — 즉시 실행
     if (document.getElementById('np')?.classList.contains('fullscreen')) {
         _highlightFsLine(idx);
     } else {
-        // instant=false → smooth scroll + transition 애니메이션 적용
         _highlightLine(idx, false);
     }
 
-    // 랜드스케이프 모드
     if (NP_LS.active) {
         NP_LS.curIdx = idx;
         _highlightLsLine(idx);
@@ -919,9 +913,6 @@ function updateBarVisibility() {
     document.getElementById('bar')?.classList.toggle('bar-hidden', !S.track);
 }
 
-/* ════════════════════════════════════════════
-   ECHO (제거됨 — 호환성 유지용 빈 함수)
-════════════════════════════════════════════ */
 function setEcho(v) { /* echo 기능 제거됨 */ }
 
 /* ════════════════════════════════════════════
@@ -1667,12 +1658,8 @@ function favCur() {
     saveFavs(); renderFavSide(); renderFavGrid(); updFavBtn();
 }
 
-/* ════════════════════════════════════════════
-   [FIX] updFavBtn — SVG 직접 조작으로 WebView CSS 우선순위 버그 해결
-════════════════════════════════════════════ */
 function updFavBtn() {
     const f = S.track && isFav(S.track.id);
-    // NP 즐겨찾기 버튼
     const npFav = document.getElementById('np-fav');
     if (npFav) {
         npFav.classList.toggle('on', !!f);
@@ -1686,13 +1673,11 @@ function updFavBtn() {
                 path.setAttribute('stroke', 'rgba(255,255,255,.5)');
             }
         }
-        // SVG stroke 색상도 직접 지정
         const svg = npFav.querySelector('svg');
         if (svg) {
             svg.style.color = f ? 'var(--acc)' : '';
         }
     }
-    // 미니바 즐겨찾기 버튼
     const bFav = document.getElementById('b-fav');
     if (bFav) {
         bFav.classList.toggle('on', !!f);
@@ -2270,11 +2255,184 @@ document.addEventListener('keydown', e => {
 });
 
 /* ════════════════════════════════════════════
+   SPRING ANIMATION ENGINE
+   물리 기반 spring으로 각 가사 줄의 속성을
+   부드럽게 보간합니다 (Apple Music 방식)
+════════════════════════════════════════════ */
+const SPRING = {
+    // stiffness, damping 조합으로 탄성 조절
+    // Apple Music 느낌: 약간 overshoot + 빠른 안정
+    stiffness: 280,
+    damping: 28,
+    mass: 1.0,
+
+    // 각 가사줄의 animated state
+    // { opacity, scale, translateY, blur, color(0~1) }
+    states: [],   // index → SpringState
+    raf: null,
+    running: false,
+};
+
+function _springCreate(init) {
+    return {
+        // 현재 값
+        opacity: { val: init.opacity, vel: 0 },
+        scale:   { val: init.scale,   vel: 0 },
+        transY:  { val: init.transY,  vel: 0 },
+        blur:    { val: init.blur,    vel: 0 },
+        // 목표 값
+        tOpacity: init.opacity,
+        tScale:   init.scale,
+        tTransY:  init.transY,
+        tBlur:    init.blur,
+    };
+}
+
+function _springStep(prop, target, dt) {
+    // Hooke's law spring
+    const k = SPRING.stiffness;
+    const c = SPRING.damping;
+    const m = SPRING.mass;
+    const dx = prop.val - target;
+    const force = -k * dx - c * prop.vel;
+    prop.vel += (force / m) * dt;
+    prop.val += prop.vel * dt;
+}
+
+function _springNeedsUpdate(state) {
+    const eps = 0.0008;
+    return (
+        Math.abs(state.opacity.val - state.tOpacity) > eps ||
+        Math.abs(state.opacity.vel) > eps ||
+        Math.abs(state.scale.val   - state.tScale)   > eps ||
+        Math.abs(state.scale.vel) > eps ||
+        Math.abs(state.transY.val  - state.tTransY)  > eps ||
+        Math.abs(state.transY.vel) > eps ||
+        Math.abs(state.blur.val    - state.tBlur)     > eps ||
+        Math.abs(state.blur.vel) > eps
+    );
+}
+
+let _springLastTime = 0;
+
+function _springLoop(timestamp) {
+    if (!SPRING.running) return;
+    const dt = Math.min((timestamp - _springLastTime) / 1000, 0.05);
+    _springLastTime = timestamp;
+    let anyActive = false;
+
+    SPRING.states.forEach((state, i) => {
+        if (!state) return;
+        const line = LY.lines[i];
+        if (!line?.el) return;
+        if (!_springNeedsUpdate(state)) return;
+        anyActive = true;
+        _springStep(state.opacity, state.tOpacity, dt);
+        _springStep(state.scale,   state.tScale,   dt);
+        _springStep(state.transY,  state.tTransY,  dt);
+        _springStep(state.blur,    state.tBlur,     dt);
+
+        // clamp
+        state.opacity.val = Math.max(0, Math.min(1, state.opacity.val));
+        state.scale.val   = Math.max(0.5, Math.min(1.3, state.scale.val));
+        state.blur.val    = Math.max(0, state.blur.val);
+
+        _applySpringToEl(line.el, state, i);
+    });
+
+    if (anyActive) {
+        SPRING.raf = requestAnimationFrame(_springLoop);
+    } else {
+        SPRING.running = false;
+        SPRING.raf = null;
+    }
+}
+
+function _startSpringLoop() {
+    if (SPRING.running) return;
+    SPRING.running = true;
+    _springLastTime = performance.now();
+    SPRING.raf = requestAnimationFrame(_springLoop);
+}
+
+/* 각 줄에 슬롯 기반 목표값 설정 */
+// d = i - activeIdx
+function _getSlotTarget(d) {
+    // d=0: 현재 (최대)
+    // d=-1: 바로 이전
+    // d=1: 다음
+    // |d|>3: 거의 안보임
+    if (d === 0)  return { opacity: 1.00, scale: 1.05,  transY:  0,   blur: 0   };
+    if (d === 1)  return { opacity: 0.62, scale: 1.00,  transY:  2,   blur: 0   };
+    if (d === -1) return { opacity: 0.48, scale: 0.98,  transY: -2,   blur: 0   };
+    if (d === 2)  return { opacity: 0.34, scale: 0.96,  transY:  4,   blur: 0.5 };
+    if (d === -2) return { opacity: 0.28, scale: 0.95,  transY: -4,   blur: 0.5 };
+    if (d === 3)  return { opacity: 0.16, scale: 0.93,  transY:  6,   blur: 1.5 };
+    if (d === -3) return { opacity: 0.12, scale: 0.92,  transY: -6,   blur: 1.5 };
+    return             { opacity: 0.04, scale: 0.90,  transY: d > 0 ? 8 : -8, blur: 3 };
+}
+
+function _getSlotColor(d) {
+    if (d === 0)  return 'rgba(255,255,255,0.97)';
+    if (d === -1) return 'rgba(255,255,255,0.52)';
+    if (d === 1)  return 'rgba(255,255,255,0.38)';
+    if (d === -2) return 'rgba(255,255,255,0.28)';
+    if (d === 2)  return 'rgba(255,255,255,0.22)';
+    if (Math.abs(d) === 3) return 'rgba(255,255,255,0.12)';
+    return 'rgba(255,255,255,0.05)';
+}
+
+function _getSlotFW(d) {
+    if (d === 0)  return '800';
+    if (Math.abs(d) <= 1) return '700';
+    return '600';
+}
+
+function _applySpringToEl(el, state, i) {
+    const d = LY._activeIdx !== undefined ? (i - LY._activeIdx) : 999;
+    el.style.opacity   = state.opacity.val.toFixed(4);
+    el.style.transform = `scale(${state.scale.val.toFixed(4)}) translateY(${state.transY.val.toFixed(3)}px)`;
+    el.style.filter    = state.blur.val > 0.05
+        ? `blur(${state.blur.val.toFixed(2)}px)`
+        : 'none';
+    el.style.color     = _getSlotColor(d);
+    el.style.fontWeight = _getSlotFW(d);
+}
+
+function _initSpringStates() {
+    SPRING.states = LY.lines.map((line, i) => {
+        const d = 999; // all hidden initially
+        const tgt = _getSlotTarget(d);
+        return _springCreate({
+            opacity: 0.04,
+            scale:   0.90,
+            transY:  0,
+            blur:    3,
+        });
+    });
+}
+
+function _updateSpringTargets(activeIdx) {
+    LY._activeIdx = activeIdx;
+    LY.lines.forEach((line, i) => {
+        if (!SPRING.states[i]) return;
+        const d = activeIdx < 0 ? 999 : (i - activeIdx);
+        const tgt = _getSlotTarget(d);
+        SPRING.states[i].tOpacity = tgt.opacity;
+        SPRING.states[i].tScale   = tgt.scale;
+        SPRING.states[i].tTransY  = tgt.transY;
+        SPRING.states[i].tBlur    = tgt.blur;
+    });
+    _startSpringLoop();
+}
+
+/* ════════════════════════════════════════════
    LYRICS SYSTEM
 ════════════════════════════════════════════ */
 const LY = {
     lines: [],
     curIdx: -1,
+    _activeIdx: -1,
     ticker: null,
     videoId: null,
     _fetching: null,
@@ -2355,14 +2513,34 @@ function _renderLyrics() {
     if (!inner || !artArea) return;
     document.getElementById('np-no-lyrics')?.remove();
     inner.innerHTML = '';
+
+    // spring state 초기화
+    SPRING.states = [];
+    LY._activeIdx = -1;
+
     LY.lines.forEach((line, i) => {
         const el = document.createElement('div');
         el.className = 'np-lyric-line';
+        // 초기 상태: 살짝 투명 + scale 작게
+        el.style.opacity    = '0.04';
+        el.style.transform  = 'scale(0.90) translateY(0px)';
+        el.style.filter     = 'blur(3px)';
+        el.style.color      = 'rgba(255,255,255,0.05)';
+        el.style.fontWeight = '600';
         el.textContent = line.text;
         el.addEventListener('click', e => seekToLyric(line.start + 0.05, e));
         inner.appendChild(el);
         LY.lines[i].el = el;
+
+        // spring state 생성
+        SPRING.states[i] = _springCreate({
+            opacity: 0.04,
+            scale:   0.90,
+            transY:  0,
+            blur:    3,
+        });
     });
+
     artArea.classList.add('has-lyrics');
     _startLyricsTick();
     if (OV.active) _buildOvLyricsDOM();
@@ -2392,6 +2570,12 @@ function _showLyricsEmpty() {
 }
 
 function _clearLyrics() {
+    // spring 중지
+    SPRING.running = false;
+    if (SPRING.raf) { cancelAnimationFrame(SPRING.raf); SPRING.raf = null; }
+    SPRING.states = [];
+    LY._activeIdx = -1;
+
     const inner = document.getElementById('np-lyrics-inner');
     const artArea = document.querySelector('.np-art-area');
     if (inner) inner.innerHTML = '';
@@ -2759,28 +2943,23 @@ function _hideFsDots() {
 }
 
 /* ════════════════════════════════════════════
-   [핵심] _highlightLine — 가사 클릭 스와이핑 애니메이션 포함
+   _highlightLine — Spring 기반 Apple Music 가사 애니메이션
 ════════════════════════════════════════════ */
 function _highlightLine(idx, instant) {
     if (document.getElementById('np')?.classList.contains('fullscreen')) {
         _highlightFsLine(idx);
         return;
     }
-    LY.lines.forEach((line, i) => {
-        if (!line.el) return;
-        line.el.classList.remove('active', 'prev', 'near');
-        if (idx < 0) return;
-        const d = i - idx;
-        if (d === 0) line.el.classList.add('active');
-        else if (d === -1) line.el.classList.add('prev');
-        else if (d >= 1 && d <= 3) line.el.classList.add('near');
-    });
+
+    // Spring 목표값 업데이트
+    _updateSpringTargets(idx);
+
+    // 스크롤: 현재 활성 줄이 중앙에 오도록
     if (idx >= 0 && LY.lines[idx]?.el) {
         const el = LY.lines[idx].el;
         const scroll = document.getElementById('np-lyrics-scroll');
         if (!scroll) return;
         const target = el.offsetTop - scroll.clientHeight / 2 + el.offsetHeight / 2;
-        // instant=true면 즉시, false면 smooth(클릭 시 스와이핑 느낌)
         scroll.scrollTo({ top: target, behavior: instant ? 'instant' : 'smooth' });
     }
 }
